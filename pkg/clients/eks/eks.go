@@ -155,7 +155,7 @@ func (e *eksClient) GetSubnetZone(subnets []string) (map[string]string, error) {
 	}
 
 	for _, v := range output.Subnets {
-		subnetAZs[*v.AvailabilityZone] = *v.SubnetId
+		subnetAZs[*v.SubnetId] = *v.AvailabilityZone
 	}
 
 	return subnetAZs, err

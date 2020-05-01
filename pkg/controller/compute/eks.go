@@ -30,16 +30,12 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 
-	"k8s.io/apimachinery/pkg/runtime/schema"
-
-	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
-	apiextension "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 
-	"k8s.io/client-go/dynamic"
+	vpccni "github.com/aws/amazon-vpc-cni-k8s/pkg/apis/crd/v1alpha1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -52,6 +48,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
+	workload "github.com/crossplane/crossplane/apis/workload/v1alpha1"
 
 	awscomputev1alpha3 "github.com/crossplane/provider-aws/apis/compute/v1alpha3"
 	cloudformationclient "github.com/crossplane/provider-aws/pkg/clients/cloudformation"
@@ -296,6 +293,26 @@ func (r *Reconciler) _customnetwork(cluster *eks.Cluster, instance *awscomputev1
 		return nil
 	}
 
+	// Patch aws-node daemonset
+	err := r.patchAWSNodeDaemonSet(cluster, instance, client)
+	if err != nil {
+		return err
+	}
+
+	// Create ENIConfig CRs
+	err = r.createENIConfigCRs(instance, client)
+	if err != nil {
+		return err
+	}
+
+	return err
+}
+
+// Patch aws-node daemonset on eks cluster
+// AWS_VPC_K8S_CNI_CUSTOM_NETWORK_CFG=true
+// ENI_CONFIG_LABEL_DEF=failure-domain.beta.kubernetes.io/zone
+func (r *Reconciler) patchAWSNodeDaemonSet(cluster *eks.Cluster, instance *awscomputev1alpha3.EKSCluster, client eks.Client) error {
+
 	// Sync aws-node to remote eks cluster to configure its network.
 	token, err := client.ConnectionToken(instance.Status.ClusterName)
 	if err != nil {
@@ -316,66 +333,11 @@ func (r *Reconciler) _customnetwork(cluster *eks.Cluster, instance *awscomputev1
 		BearerToken: token,
 	}
 
-	// Patch aws-node daemonset
-	err = r.patchAWSNodeDaemonSet(config)
-	if err != nil {
-		return err
-	}
-
-	// Create ENIConfig CRD & CRs
-	err = r.createENIConfigCRD(config)
-	if err != nil {
-		return err
-	}
-	err = r.createENIConfigCRs(instance, client, config)
-	if err != nil {
-		return err
-	}
-
-	return err
-}
-
-// Patch aws-node daemonset on eks cluster
-// AWS_VPC_K8S_CNI_CUSTOM_NETWORK_CFG=true
-// ENI_CONFIG_LABEL_DEF=failure-domain.beta.kubernetes.io/zone
-func (r *Reconciler) patchAWSNodeDaemonSet(config rest.Config) error {
-
 	clientset, err := kubernetes.NewForConfig(&config)
 	if err != nil {
 		return err
 	}
 
-	// NOT WORKING:
-	// failed to set custom network on eks: DaemonSet.apps "aws-node" is invalid: [spec.template.metadata.labels: Invalid value: map[string]string{"k8s-app":"aws-node"}: `selector` does not match template `labels`, spec.selector: Invalid value: "null": field is immutable]
-	// patch := &apps.DaemonSet{
-	// 	Spec: apps.DaemonSetSpec{
-	// 		Template: v1.PodTemplateSpec{
-	// 			Spec: v1.PodSpec{
-	// 				Containers: []v1.Container{
-	// 					{
-	// 						Name: "aws-node",
-	// 						Env: []v1.EnvVar{
-	// 							{
-	// 								Name:  "AWS_VPC_K8S_CNI_CUSTOM_NETWORK_CFG",
-	// 								Value: "true",
-	// 							},
-	// 							{
-	// 								Name:  "ENI_CONFIG_LABEL_DEF",
-	// 								Value: "failure-domain.beta.kubernetes.io/zone",
-	// 							},
-	// 						},
-	// 					},
-	// 				},
-	// 			},
-	// 		},
-	// 	},
-	// }
-	// byteBuffer := new(bytes.Buffer)
-	// if err := json.NewEncoder(byteBuffer).Encode(patch); err != nil {
-	// 	return err
-	// }
-
-	// patch := byteBuffer.Bytes()
 	patch, _ := json.Marshal(map[string]interface{}{
 		"spec": map[string]interface{}{
 			"template": map[string]interface{}{
@@ -395,69 +357,21 @@ func (r *Reconciler) patchAWSNodeDaemonSet(config rest.Config) error {
 	return err
 }
 
-// create the ENIConfig CRD
-func (r *Reconciler) createENIConfigCRD(config rest.Config) error {
+// create KubernetesApplicationResources to apply the ENIConfig Custom Resources
+func (r *Reconciler) createENIConfigCRs(instance *awscomputev1alpha3.EKSCluster, client eks.Client) error {
 
-	clientset, err := apiextension.NewForConfig(&config)
-	if err != nil {
-		return err
-	}
+	// Get claim namespace (for resource creation) and
+	// UID of KubernetesCluster (for ownerreference)
+	uid := instance.Spec.WriteConnectionSecretToReference.Name
+	namespace := instance.Spec.ClaimReference.Namespace
 
-	// create the ENIConfig Custom Resource Definition
-	eniConfigCRD := &apiextensionsv1beta1.CustomResourceDefinition{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "eniconfigs.crd.k8s.amazonaws.com",
-		},
-		Spec: apiextensionsv1beta1.CustomResourceDefinitionSpec{
-			Group:   "crd.k8s.amazonaws.com",
-			Version: "v1alpha1",
-			Scope:   apiextensionsv1beta1.ClusterScoped,
-			Names: apiextensionsv1beta1.CustomResourceDefinitionNames{
-				Plural:   "eniconfigs",
-				Singular: "eniconfig",
-				Kind:     "ENIConfig",
-			},
-		},
-	}
-
-	_, err = clientset.ApiextensionsV1beta1().CustomResourceDefinitions().Create(eniConfigCRD)
-	if err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			r.log.Debug("clientset", "IsAlreadyExists", err)
-			err = nil
-			// _, err = clientset.ApiextensionsV1beta1().CustomResourceDefinitions().Update(crd)
-			// if err != nil {
-			// 	r.log.Debug("Kein", "Update", err)
-			// 	return err
-			// }
-		}
-	}
-	return err
-}
-
-// create a dynamic client to apply the ENIConfig Custom Resources
-func (r *Reconciler) createENIConfigCRs(instance *awscomputev1alpha3.EKSCluster, client eks.Client, config rest.Config) error {
-	dynClient, err := dynamic.NewForConfig(&config)
-	if err != nil {
-		return err
-	}
-
-	var (
-		eniConfigCRs = []unstructured.Unstructured{}
-		eniConfigGVR = schema.GroupVersionResource{
-			Group:    "crd.k8s.amazonaws.com",
-			Version:  "v1alpha1",
-			Resource: "eniconfigs",
-		}
-	)
-
-	// get Subnet/AvailabilityZone tupel for use in ENIConfig CR
+	// get Subnet/AvailabilityZone tupel
 	subnetAZs, err := client.GetSubnetZone(instance.Spec.CustomSubnetIDs)
 	if err != nil {
 		return err
 	}
 
-	// get workernode security group for use in ENIConfig CR
+	// get workernode security group
 	var workerSecurityGroup string
 	if instance.Status.CloudFormationStackID != "" {
 		clusterWorker, err := client.GetWorkerNodes(instance.Status.CloudFormationStackID)
@@ -467,58 +381,68 @@ func (r *Reconciler) createENIConfigCRs(instance *awscomputev1alpha3.EKSCluster,
 		workerSecurityGroup = clusterWorker.WorkerSecurityGroup
 	}
 
-	// create unstructured ENIConfig object
-	// aws-vpc-cni doesn't export a clientset yet
-	// https://github.com/aws/amazon-vpc-cni-k8s/pull/227
-	for availabilityZone, subnet := range subnetAZs {
-		eniConfigCR := unstructured.Unstructured{
-			Object: map[string]interface{}{
-				"apiVersion": "crd.k8s.amazonaws.com/v1alpha1",
-				"kind":       "ENIConfig",
-				"metadata": map[string]interface{}{
-					"name":      availabilityZone,
-					"namespace": "default",
-				},
-				"spec": map[string]interface{}{
-					"securityGroups": []string{workerSecurityGroup},
-					"subnet":         subnet,
-				},
-			},
-		}
-		eniConfigCRs = append(eniConfigCRs, eniConfigCR)
-	}
+	// assemble a KubernetesApplicationResource for each subnet
+	if namespace != "" && uid != "" {
+		for subnet, availabilityZone := range subnetAZs {
 
-	// // create ENIConfig CRs
-	// // this doesn't work with the dynamic client?
-	// cr1 := &vpccni.ENIConfig{
-	// 	TypeMeta: metav1.TypeMeta{
-	// 		APIVersion: "crd.k8s.amazonaws.com/v1alpha1",
-	// 		Kind:       "ENIConfig",
-	// 	},
-	// 	ObjectMeta: metav1.ObjectMeta{
-	// 		Name: "eu-west-1a",
-	// 	    Namespace: "default",
-	// 	},
-	// 	Spec: vpccni.ENIConfigSpec{
-	// 		SecurityGroups: []string{},
-	// 		Subnet:         "subnet-026c046bb4fbd1468",
-	// 	},
-	// }
-
-	crdClient := dynClient.Resource(eniConfigGVR)
-	for _, eniConfig := range eniConfigCRs {
-		eniConfig := eniConfig
-		_, err = crdClient.Create(&eniConfig, metav1.CreateOptions{})
-		if err != nil {
-			if apierrors.IsAlreadyExists(err) {
-				r.log.Debug("ENIConfig", "IsAlreadyExists", eniConfig.GetName)
-				// TODO
-				// get object and patch or overwrite
-				// _, err = crdClient.Update(&cr, metav1.UpdateOptions{})
-				err = nil
+			// create ENIConfig object
+			eniConfigCR := &vpccni.ENIConfig{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "crd.k8s.amazonaws.com/v1alpha1",
+					Kind:       "ENIConfig",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      availabilityZone,
+					Namespace: "default",
+				},
+				Spec: vpccni.ENIConfigSpec{
+					SecurityGroups: []string{workerSecurityGroup},
+					Subnet:         subnet,
+				},
 			}
+
+			// create KAR and embed ENIConfig
+			kubernetesApplicationResource := workload.KubernetesApplicationResource{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      instance.GetName() + "-eniconfig-" + availabilityZone,
+					Namespace: namespace,
+				},
+				Spec: workload.KubernetesApplicationResourceSpec{
+					Target: &workload.KubernetesTargetReference{
+						Name: uid,
+					},
+					Template: runtime.RawExtension{
+						Object: eniConfigCR,
+					},
+				},
+			}
+
+			// set ControllerReference so that the object is garbagecollected
+			err = meta.AddControllerReference(&kubernetesApplicationResource, metav1.OwnerReference{
+				UID:        instance.GetUID(),
+				Name:       instance.GetName(),
+				Kind:       "EKSCluster",
+				APIVersion: "v1alpha3",
+			})
+			if err != nil {
+				return err
+			}
+
+			kubernetesApplicationResource.SetGroupVersionKind(workload.KubernetesApplicationResourceGroupVersionKind)
+
+			// create the KubernetesApplicationResource
+			err = r.Client.Create(ctx, &kubernetesApplicationResource)
+			if err != nil {
+				if apierrors.IsAlreadyExists(err) {
+					// err = r.Client.Update(ctx, &kubernetesApplicationResource)
+					continue
+				}
+				return err
+			}
+
 		}
 	}
+
 	return err
 }
 
@@ -614,6 +538,7 @@ func (r *Reconciler) _secret(cluster *eks.Cluster, instance *awscomputev1alpha3.
 // _delete check reclaim policy and if needed delete the eks cluster resource
 func (r *Reconciler) _delete(instance *awscomputev1alpha3.EKSCluster, client eks.Client) (reconcile.Result, error) {
 	instance.Status.SetConditions(runtimev1alpha1.Deleting())
+
 	if instance.Spec.ReclaimPolicy == runtimev1alpha1.ReclaimDelete {
 		var deleteErrors []string
 		if err := client.Delete(instance.Status.ClusterName); err != nil && !eks.IsErrorNotFound(err) {

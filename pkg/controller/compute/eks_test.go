@@ -212,12 +212,13 @@ func TestSync(t *testing.T) {
 	g := NewGomegaWithT(t)
 	fakeStackID := "fake-stack-id"
 
-	test := func(tc *EKSCluster, cl *fake.MockEKSClient, sec func(*eks.Cluster, *EKSCluster, eks.Client) error, auth func(*eks.Cluster, *EKSCluster, eks.Client, string) error,
+	test := func(tc *EKSCluster, cl *fake.MockEKSClient, sec func(*eks.Cluster, *EKSCluster, eks.Client) error, auth func(*eks.Cluster, *EKSCluster, eks.Client, string) error, cn func(*eks.Cluster, *EKSCluster, eks.Client) error,
 		rslt reconcile.Result, exp runtimev1alpha1.ConditionedStatus) *EKSCluster {
 		r := &Reconciler{
 			Client:            NewFakeClient(tc),
 			secret:            sec,
 			awsauth:           auth,
+			customnetwork:     cn,
 			ReferenceResolver: managed.NewAPIReferenceResolver(NewFakeClient()),
 		}
 
@@ -252,7 +253,7 @@ func TestSync(t *testing.T) {
 	expectedStatus := runtimev1alpha1.ConditionedStatus{}
 	expectedStatus.SetConditions(runtimev1alpha1.ReconcileError(errorGet))
 	tc := testCluster()
-	test(tc, cl, nil, nil, reconcile.Result{RequeueAfter: aShortWait}, expectedStatus)
+	test(tc, cl, nil, nil, nil, reconcile.Result{RequeueAfter: aShortWait}, expectedStatus)
 
 	// cluster is not ready
 	cl.MockGet = func(string) (*eks.Cluster, error) {
@@ -262,7 +263,7 @@ func TestSync(t *testing.T) {
 	}
 	expectedStatus = runtimev1alpha1.ConditionedStatus{}
 	tc = testCluster()
-	test(tc, cl, nil, nil, reconcile.Result{RequeueAfter: aShortWait}, expectedStatus)
+	test(tc, cl, nil, nil, nil, reconcile.Result{RequeueAfter: aShortWait}, expectedStatus)
 
 	// cluster is ready, but lets create workers that error
 	cl.MockGet = func(string) (*eks.Cluster, error) {
@@ -279,7 +280,7 @@ func TestSync(t *testing.T) {
 	expectedStatus = runtimev1alpha1.ConditionedStatus{}
 	expectedStatus.SetConditions(runtimev1alpha1.ReconcileError(errorCreateNodes))
 	tc = testCluster()
-	reconciledCluster := test(tc, cl, nil, nil, reconcile.Result{RequeueAfter: aShortWait}, expectedStatus)
+	reconciledCluster := test(tc, cl, nil, nil, nil, reconcile.Result{RequeueAfter: aShortWait}, expectedStatus)
 	g.Expect(reconciledCluster.Status.CloudFormationStackID).To(BeEmpty())
 
 	// cluster is ready, lets create workers
@@ -296,7 +297,7 @@ func TestSync(t *testing.T) {
 	expectedStatus = runtimev1alpha1.ConditionedStatus{}
 	expectedStatus.SetConditions(runtimev1alpha1.ReconcileSuccess())
 	tc = testCluster()
-	reconciledCluster = test(tc, cl, nil, nil, reconcile.Result{RequeueAfter: aShortWait}, expectedStatus)
+	reconciledCluster = test(tc, cl, nil, nil, nil, reconcile.Result{RequeueAfter: aShortWait}, expectedStatus)
 	g.Expect(reconciledCluster.Status.CloudFormationStackID).To(Equal(fakeStackID))
 
 	// cluster is ready, but auth sync failed
@@ -318,7 +319,7 @@ func TestSync(t *testing.T) {
 		return errorAuth
 
 	}
-	test(tc, cl, nil, auth, reconcile.Result{RequeueAfter: aShortWait}, expectedStatus)
+	test(tc, cl, nil, auth, nil, reconcile.Result{RequeueAfter: aShortWait}, expectedStatus)
 
 	// cluster is ready, but secret failed
 	cl.MockGetWorkerNodes = func(string) (*eks.ClusterWorkers, error) {
@@ -333,6 +334,9 @@ func TestSync(t *testing.T) {
 	auth = func(*eks.Cluster, *EKSCluster, eks.Client, string) error {
 		return nil
 	}
+	cn := func(*eks.Cluster, *EKSCluster, eks.Client) error {
+		return nil
+	}
 
 	errorSecret := errors.New("secret")
 	fSec := func(*eks.Cluster, *EKSCluster, eks.Client) error {
@@ -342,7 +346,7 @@ func TestSync(t *testing.T) {
 	expectedStatus.SetConditions(runtimev1alpha1.ReconcileError(errorSecret))
 	tc = testCluster()
 	tc.Status.CloudFormationStackID = fakeStackID
-	test(tc, cl, fSec, auth, reconcile.Result{RequeueAfter: aShortWait}, expectedStatus)
+	test(tc, cl, fSec, auth, cn, reconcile.Result{RequeueAfter: aShortWait}, expectedStatus)
 
 	// cluster is ready
 	fSec = func(*eks.Cluster, *EKSCluster, eks.Client) error {
@@ -352,7 +356,7 @@ func TestSync(t *testing.T) {
 	expectedStatus.SetConditions(runtimev1alpha1.Available(), runtimev1alpha1.ReconcileSuccess())
 	tc = testCluster()
 	tc.Status.CloudFormationStackID = fakeStackID
-	test(tc, cl, fSec, auth, reconcile.Result{RequeueAfter: aLongWait}, expectedStatus)
+	test(tc, cl, fSec, auth, cn, reconcile.Result{RequeueAfter: aLongWait}, expectedStatus)
 }
 
 func TestSecret(t *testing.T) {
